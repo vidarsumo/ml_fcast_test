@@ -1,0 +1,689 @@
+---
+title: "Untitled"
+output:
+    github_document:
+        toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, out.width = "100%")
+
+# Time Series ML
+library(tidymodels)
+library(modeltime)
+library(rules)
+
+# Timing & Parallel Processing
+library(tictoc)
+library(future)
+library(doFuture)
+
+# Core 
+library(plotly)
+library(tidyverse)
+library(lubridate)
+library(timetk)
+library(rprojroot)
+
+```
+
+```{r}
+root <- is_rstudio_project
+data_tbl <- read_csv(root$find_file("data.csv"))
+horizon <- 12
+```
+
+
+```{r}
+data_tbl %>% 
+    plot_time_series(date, sala, .smooth = FALSE, .interactive = FALSE)
+```
+
+### Preprocessing and time series signature
+```{r}
+data_prep_tbl <- data_tbl %>% 
+    mutate(sala_trans = log(sala)) %>% 
+    select(-sala)
+
+data_prep_signature_tbl <- data_prep_tbl %>% 
+    tk_augment_timeseries_signature() %>% 
+    select(-contains(".iso"), -contains(".xts"), -contains("hour"), -contains("minute"), -diff,
+           -contains("second"), -contains("am.pm"), -contains("week"), -contains("mday"), -contains("day"))
+```
+
+
+### Trend
+
+```{r}
+data_prep_signature_tbl %>% 
+    head(-horizon) %>% 
+    plot_time_series_regression(
+        date,
+        .formula = sala_trans ~ index.num,
+        .interactive = FALSE
+    )
+```
+
+
+```{r}
+data_prep_signature_tbl %>% 
+    head(-horizon) %>%
+    plot_time_series_regression(
+        date,
+        .formula = sala_trans ~ splines::ns(index.num, df = 4),
+        .interactive = FALSE
+    )
+```
+
+## Seasonal features
+
+### Monthly seasonality
+
+```{r}
+data_prep_signature_tbl %>% 
+    head(-horizon) %>% 
+    plot_time_series_regression(
+        date,
+        .formula = sala_trans ~ month.lbl,
+        .interactive = FALSE
+    )
+```
+
+
+### Quarterly seasonality
+```{r}
+data_prep_signature_tbl %>% 
+    head(-horizon) %>% 
+    plot_time_series_regression(
+        date,
+        .formula = sala_trans ~ as.factor(quarter),
+        .interactive = FALSE
+    )
+```
+
+
+### Monthly seasonality and trend
+
+```{r}
+data_prep_signature_tbl %>% 
+    head(-horizon) %>% 
+    plot_time_series_regression(
+        date,
+        .formula = sala_trans ~ splines::ns(index.num, df = 4) + month.lbl +  as.factor(quarter),
+        .show_summary = TRUE,
+        .interactive = FALSE
+    )
+```
+
+## Features - Non-time based
+
+```{r}
+model_formula <- as.formula(
+    sala_trans ~ splines::ns(index.num, df = 4) + month.lbl + .
+)
+```
+
+
+### Fourier series
+
+```{r}
+data_prep_signature_tbl %>% 
+    head(-horizon) %>% 
+    plot_acf_diagnostics(date, sala_trans,
+                         .interactive = FALSE)
+```
+
+
+```{r}
+data_prep_fourier_tbl <- data_prep_signature_tbl %>% 
+    tk_augment_fourier(
+        .date    = date,
+        .periods = c(2, 19, 25, 30),
+        .K       = 5
+    )
+
+data_prep_fourier_tbl %>% 
+    head(-horizon) %>% 
+    # filter(date >= "2007-01-01") %>% 
+    plot_time_series_regression(
+        date,
+        .formula = model_formula,
+        .show_summary = TRUE,
+        .interactive = FALSE
+    )
+```
+
+### Lags
+Doesn't add much when compared to above (note that I have to filter date >= "2007-01-01" above to make these two comparable).
+```{r}
+data_prep_lag_tbl <- data_prep_fourier_tbl %>% 
+    tk_augment_lags(sala_trans, .lags = 12) %>% 
+    drop_na()
+
+data_prep_lag_tbl %>% 
+    head(-horizon) %>% 
+    plot_time_series_regression(
+        date,
+        .formula = model_formula,
+        .show_summary = TRUE,
+        .interactive = FALSE
+    )
+```
+
+### Rolling features
+
+```{r}
+data_prep_rolling_lag_tbl <- data_prep_lag_tbl %>% 
+    tk_augment_slidify(
+        .value   = sala_trans_lag12,
+        .f       = mean,
+        .period  = c(6, 12, 24),
+        .align   = "center",
+        .partial = TRUE
+    )
+
+data_prep_rolling_lag_tbl %>% 
+    head(-horizon) %>% 
+    plot_time_series_regression(
+        date,
+        .formula = model_formula,
+        .show_summary = TRUE,
+        .interactive = FALSE
+    )
+```
+
+
+## Feature engineering - Next step
+
+### Create full data set
+```{r}
+lag_period <- 12
+
+data_prep_full_tbl <- data_prep_tbl %>% 
+    
+    # add future window
+    bind_rows(
+        future_frame(.data = ., .date_var = date, .length_out = horizon)
+    ) %>% 
+
+
+    # add lags
+    tk_augment_lags(sala_trans, .lags = lag_period) %>% 
+    
+    # add rolling lags
+    tk_augment_slidify(
+        .value   = sala_trans_lag12,
+        .f       = mean,
+        .period  = c(6, 12, 24),
+        .align   = "center",
+        .partial = TRUE
+    )
+
+
+```
+
+
+### Modeling and forecasting data
+
+```{r}
+data_prepared_tbl <- data_prep_full_tbl %>% 
+    filter(!(is.na(sala_trans)))
+
+forecast_tbl <- data_prep_full_tbl %>% 
+    filter(is.na(sala_trans))
+```
+
+
+### Train/test data
+
+```{r}
+
+splits <- time_series_split(data_prepared_tbl, assess = horizon, cumulative = TRUE)
+
+# Can't do it by group
+splits %>%
+    tk_time_series_cv_plan() %>%
+    plot_time_series_cv_plan(date, sala_trans,
+                             .interactive = FALSE)
+
+```
+
+
+##  Recipe
+
+```{r}
+recipe_spec_base <- recipe(sala_trans ~ .,
+                           data = training(splits)) %>% 
+    
+    # Time sereis features
+    step_timeseries_signature(date) %>%
+    step_rm(contains(".iso"), contains(".xts"), contains("hour"), contains("minute"),
+           contains("second"), contains("am.pm"), contains("week"), contains("mday"), contains("day")) %>%
+    
+    # Standardize
+    step_normalize(matches("(index.num)|(year)|(yday)")) %>% 
+
+    # dummy encoding
+    step_dummy(all_nominal(), one_hot = TRUE) %>% 
+    
+    # Fourier
+    step_fourier(date, period = c(2, 19, 25, 30), K = 5)
+
+recipe_spec_base %>% prep() %>% juice() %>% glimpse()
+```
+
+
+### Analyze diferent recipes
+
+```{r}
+model_spec_lm <- linear_reg() %>% 
+    set_engine("lm")
+```
+
+#### Spline recipe
+
+```{r}
+recipe_spec_1_spline <- recipe_spec_base %>% 
+    step_rm(date) %>%
+    step_ns(ends_with("index.num"), deg_free = 5) %>%
+    step_rm(contains("_lag"))
+```
+
+
+```{r}
+
+wflw_fit_lm_1_spline <- workflow() %>% 
+    add_model(model_spec_lm) %>% 
+    add_recipe(recipe_spec_1_spline) %>% 
+    fit(training(splits))
+
+calibration_tbl <- modeltime_table(
+    wflw_fit_lm_1_spline) %>% 
+    modeltime_calibrate(new_data = testing(splits))
+
+calibration_tbl %>% 
+    modeltime_forecast(new_data    = testing(splits),
+                       actual_data = data_prepared_tbl) %>% 
+    plot_modeltime_forecast(.interactive = FALSE)
+```
+
+#### Lag recipe
+
+```{r}
+recipe_spec_2_lag <- recipe_spec_base %>% 
+    step_rm(date) %>% 
+    step_naomit(contains("_lag"))
+```
+
+
+```{r}
+
+wflw_fit_lm_1_lag <- workflow() %>% 
+    add_model(model_spec_lm) %>% 
+    add_recipe(recipe_spec_2_lag) %>% 
+    fit(training(splits))
+
+calibration_tbl <- modeltime_table(
+    wflw_fit_lm_1_lag) %>% 
+    modeltime_calibrate(new_data = testing(splits))
+
+calibration_tbl %>% 
+    modeltime_forecast(new_data    = testing(splits),
+                       actual_data = data_prepared_tbl) %>% 
+    plot_modeltime_forecast(.interactive = FALSE)
+```
+
+# Modeling
+
+```{r}
+calibrate_and_plot <-
+    function(..., type = "testing") {
+        if (type == "testing") {
+            new_data <- testing(splits)
+        } else {
+            new_data <- training(splits) %>%
+                drop_na()
+        }
+        
+        calibration_tbl <- modeltime_table(...) %>%
+            modeltime_calibrate(new_data)
+        
+        print(calibration_tbl %>% modeltime_accuracy())
+        
+        calibration_tbl %>%
+            modeltime_forecast(
+                new_data = new_data,
+                actual_data = data_prepared_tbl
+            ) %>%
+            plot_modeltime_forecast(.conf_interval_show = FALSE, .interactive = FALSE)
+        
+    }
+```
+
+
+## ETS
+
+```{r}
+model_fit_ets <- exp_smoothing() %>% 
+    set_engine("ets") %>% 
+    fit(sala_trans ~ date, data = training(splits))
+
+calibrate_and_plot(model_fit_ets, type = "testing")
+
+```
+
+
+## Elastic net
+No difference between the two recipes. I'll choose _spline for hyperparameter tuning.
+```{r}
+
+model_spec_glmnet <- linear_reg(
+    mode = "regression",
+    penalty = 0.1,
+    mixture = 0.2
+) %>% 
+    set_engine("glmnet")
+
+wflw_fit_glmnet_spline <- workflow() %>%
+    add_model(model_spec_glmnet) %>%
+    add_recipe(recipe_spec_1_spline) %>%
+    fit(training(splits))
+
+
+wflw_fit_glmnet_lag <- workflow() %>%
+    add_model(model_spec_glmnet) %>%
+    add_recipe(recipe_spec_2_lag) %>%
+    fit(training(splits))
+
+calibrate_and_plot(
+    wflw_fit_glmnet_spline,
+    wflw_fit_glmnet_lag
+)
+```
+
+## XGBoost
+
+```{r}
+model_spec_boost <- boost_tree(
+    mode = "regression",
+    mtry =  10,
+    trees = 1000,           
+    min_n = 1,
+    tree_depth = 10,
+    learn_rate = 0.005,
+    loss_reduction = 0.01
+) %>%
+    set_engine("xgboost")
+
+# Spline
+
+set.seed(123)
+wflw_fit_xgboost_spline <- workflow() %>%
+    add_model(model_spec_boost) %>%
+    add_recipe(recipe_spec_1_spline) %>%
+    fit(training(splits))
+
+set.seed(123)
+wflw_fit_xgboost_lag <- workflow() %>%
+    add_model(model_spec_boost) %>%
+    add_recipe(recipe_spec_2_lag) %>%
+    fit(training(splits))
+
+calibrate_and_plot(
+    wflw_fit_xgboost_spline,
+    wflw_fit_xgboost_lag
+)
+
+
+```
+
+
+# Hyperparameter tuning
+
+## Elastic net
+
+```{r}
+wflw_glmnet_use <- wflw_fit_glmnet_spline
+
+recipe_glmnet_use <- wflw_glmnet_use %>%
+                pull_workflow_preprocessor()
+
+model_spec_glmnet <- linear_reg(
+     penalty = tune(),
+     mixture = tune()
+     ) %>%
+     set_engine("glmnet")
+
+grid_spec_glmnet <- grid_latin_hypercube(
+    parameters(model_spec_glmnet),
+    size = 100
+    )
+
+grid_spec_glmnet
+
+
+wflw_glmnet_use <- wflw_glmnet_use %>%
+            update_model(model_spec_glmnet)
+```
+
+
+### Time series cross validation
+
+```{r}
+resamples_tscv <- time_series_cv(
+    data        = training(splits) %>% drop_na(),
+    cumulative  = TRUE,
+    assess      = "12 month",
+    slice_limit = 10,
+    skip        = "6 month"
+    )
+
+resamples_tscv %>% 
+    tk_time_series_cv_plan() %>% 
+    plot_time_series_cv_plan(date, sala_trans, .facet_ncol = 2, .interactive = FALSE)
+
+```
+
+
+```{r, cache=TRUE}
+registerDoFuture()
+n_cores <- detectCores()
+plan(
+    strategy = cluster,
+    workers  = parallel::makeCluster(n_cores)
+    )
+
+set.seed(123)
+tune_results_glmnet <- wflw_glmnet_use %>%
+    tune_grid(
+        resamples = resamples_tscv,
+        grid      = grid_spec_glmnet,
+        metrics   = default_forecast_accuracy_metric_set(),
+        control   = control_grid(verbose = FALSE, save_pred = TRUE)
+        )
+
+ plan(strategy = sequential)
+ 
+ 
+ tune_results_glmnet %>%
+     autoplot() +
+     geom_smooth(se = FALSE)
+```
+
+
+```{r}
+wflw_glmnet_final <-  wflw_glmnet_use %>%
+    finalize_workflow(
+        tune_results_glmnet %>% show_best(metric = "rmse") %>% dplyr::slice(1)
+        ) %>%
+    fit(training(splits) %>% drop_na())
+
+calibrate_and_plot(wflw_glmnet_final)
+```
+
+
+### K-fold cross validation
+
+
+```{r}
+resamples_kfold <- vfold_cv(
+    data = training(splits) %>% drop_na(),
+    v = 10,
+    repeats = 1
+    )
+
+resamples_kfold %>% 
+    tk_time_series_cv_plan() %>% 
+    plot_time_series_cv_plan(date, sala_trans, .facet_ncol = 2, .interactive = FALSE)
+    
+```
+
+
+```{r, cache=TRUE}
+registerDoFuture()
+n_cores <- detectCores()
+plan(
+    strategy = cluster,
+    workers  = parallel::makeCluster(n_cores)
+    )
+
+set.seed(123)
+tune_results_glmnet_kfold <- wflw_glmnet_use %>%
+    tune_grid(
+        resamples = resamples_kfold,
+        grid      = grid_spec_glmnet,
+        metrics   = default_forecast_accuracy_metric_set(),
+        control   = control_grid(verbose = FALSE, save_pred = TRUE)
+        )
+
+ plan(strategy = sequential)
+ 
+ 
+ tune_results_glmnet_kfold %>%
+     autoplot() +
+     geom_smooth(se = FALSE)
+```
+
+
+```{r}
+wflw_glmnet_final_kfold <-  wflw_glmnet_use %>%
+    finalize_workflow(
+        tune_results_glmnet_kfold %>% show_best(metric = "rmse") %>% dplyr::slice(1)
+        ) %>%
+    fit(training(splits) %>% drop_na())
+
+calibrate_and_plot(wflw_glmnet_final_kfold)
+```
+
+
+## XGBoost
+
+```{r}
+wflw_xgboost_use <- wflw_fit_glmnet_lag
+
+recipe_xgboost_use <- wflw_xgboost_use %>%
+                pull_workflow_preprocessor()
+
+model_spec_xgboost <- boost_tree(
+    mode = "regression",
+    mtry =  tune(),
+    trees = 500,
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune()
+    ) %>%
+    set_engine("xgboost")
+
+grid_spec_xgboost <- grid_latin_hypercube(
+    parameters(model_spec_xgboost) %>% 
+        update(mtry = mtry(range = c(1, 61))),
+    size = 100
+    )
+
+grid_spec_xgboost
+
+
+wflw_xgboost_use <- wflw_xgboost_use %>%
+            update_model(model_spec_xgboost)
+
+```
+
+### Time series cross validation
+
+```{r, cache=TRUE}
+registerDoFuture()
+n_cores <- detectCores()
+plan(
+    strategy = cluster,
+    workers  = parallel::makeCluster(n_cores)
+    )
+
+set.seed(123)
+tune_results_xgboost <- wflw_xgboost_use %>%
+    tune_grid(
+        resamples = resamples_tscv,
+        grid      = grid_spec_xgboost,
+        metrics   = default_forecast_accuracy_metric_set(),
+        control   = control_grid(verbose = FALSE, save_pred = TRUE)
+        )
+
+ plan(strategy = sequential)
+ 
+ 
+ tune_results_xgboost %>%
+     autoplot() +
+     geom_smooth(se = FALSE)
+```
+
+
+```{r}
+wflw_xgboost_final <-  wflw_xgboost_use %>%
+    finalize_workflow(
+        tune_results_xgboost %>% show_best(metric = "rmse") %>% dplyr::slice(1)
+        ) %>%
+    fit(training(splits) %>% drop_na())
+
+calibrate_and_plot(wflw_xgboost_final)
+```
+
+
+### K-fold cross validation
+
+```{r, cache=TRUE}
+registerDoFuture()
+n_cores <- detectCores()
+plan(
+    strategy = cluster,
+    workers  = parallel::makeCluster(n_cores)
+    )
+
+set.seed(123)
+tune_results_xgboost_kfold <- wflw_xgboost_use %>%
+    tune_grid(
+        resamples = resamples_kfold,
+        grid      = grid_spec_xgboost,
+        metrics   = default_forecast_accuracy_metric_set(),
+        control   = control_grid(verbose = FALSE, save_pred = TRUE)
+        )
+
+ plan(strategy = sequential)
+ 
+ 
+ tune_results_xgboost_kfold %>%
+     autoplot() +
+     geom_smooth(se = FALSE)
+```
+
+
+```{r}
+wflw_xgboost_final_kfold <-  wflw_xgboost_use %>%
+    finalize_workflow(
+        tune_results_xgboost_kfold %>% show_best(metric = "rmse") %>% dplyr::slice(1)
+        ) %>%
+    fit(training(splits) %>% drop_na())
+
+calibrate_and_plot(wflw_xgboost_final_kfold)
+```
+
+
