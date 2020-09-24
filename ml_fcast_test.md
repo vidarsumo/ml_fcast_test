@@ -1,6 +1,37 @@
 Untitled
 ================
 
+  - [Preprocessing and time series
+    signature](#preprocessing-and-time-series-signature)
+  - [Trend](#trend)
+  - [Seasonal features](#seasonal-features)
+      - [Monthly seasonality](#monthly-seasonality)
+      - [Quarterly seasonality](#quarterly-seasonality)
+      - [Monthly seasonality and trend](#monthly-seasonality-and-trend)
+  - [Features - Non-time based](#features---non-time-based)
+      - [Fourier series](#fourier-series)
+      - [Lags](#lags)
+      - [Rolling features](#rolling-features)
+  - [Feature engineering - Next step](#feature-engineering---next-step)
+      - [Create full data set](#create-full-data-set)
+      - [Modeling and forecasting data](#modeling-and-forecasting-data)
+      - [Train/test data](#traintest-data)
+  - [Recipe](#recipe)
+      - [Analyze diferent recipes](#analyze-diferent-recipes)
+  - [Modeling](#modeling)
+      - [ETS](#ets)
+      - [Elastic net](#elastic-net)
+      - [XGBoost](#xgboost)
+  - [Hyperparameter tuning](#hyperparameter-tuning)
+      - [Elastic net](#elastic-net-1)
+          - [Time series cross
+            validation](#time-series-cross-validation)
+          - [K-fold cross validation](#k-fold-cross-validation)
+      - [XGBoost](#xgboost-1)
+          - [Time series cross
+            validation](#time-series-cross-validation-1)
+          - [K-fold cross validation](#k-fold-cross-validation-1)
+
 ``` r
 root <- is_rstudio_project
 data_tbl <- read_csv(root$find_file("data.csv"))
@@ -791,12 +822,12 @@ calibrate_and_plot(
 ## Elastic net
 
 ``` r
-wflw_glmnet_final <- wflw_fit_glmnet_spline
+wflw_glmnet_use <- wflw_fit_glmnet_spline
 
-recipe_glmnet_use <- wflw_glmnet_final %>%
+recipe_glmnet_use <- wflw_glmnet_use %>%
                 pull_workflow_preprocessor()
 
- model_spec_glmnet <- linear_reg(
+model_spec_glmnet <- linear_reg(
      penalty = tune(),
      mixture = tune()
      ) %>%
@@ -804,32 +835,290 @@ recipe_glmnet_use <- wflw_glmnet_final %>%
 
 grid_spec_glmnet <- grid_latin_hypercube(
     parameters(model_spec_glmnet),
-    size = 20
+    size = 100
     )
 
 grid_spec_glmnet
 ```
 
-    ## # A tibble: 20 x 2
+    ## # A tibble: 100 x 2
     ##     penalty mixture
     ##       <dbl>   <dbl>
-    ##  1 1.95e- 2  0.330 
-    ##  2 4.10e- 3  0.362 
-    ##  3 9.73e- 2  0.572 
-    ##  4 2.32e- 8  0.679 
-    ##  5 1.50e- 4  0.277 
-    ##  6 7.27e- 5  0.936 
-    ##  7 2.21e-10  0.858 
-    ##  8 5.25e- 7  0.644 
-    ##  9 5.49e- 1  0.174 
-    ## 10 2.55e- 7  0.0756
-    ## 11 3.89e- 8  0.576 
-    ## 12 1.36e- 1  0.429 
-    ## 13 1.34e- 3  0.495 
-    ## 14 1.21e- 5  0.218 
-    ## 15 1.01e- 6  0.431 
-    ## 16 6.13e- 4  0.989 
-    ## 17 2.03e- 9  0.734 
-    ## 18 3.33e-10  0.786 
-    ## 19 6.90e- 6  0.137 
-    ## 20 7.09e- 9  0.841
+    ##  1 1.81e- 2  0.0686
+    ##  2 2.65e- 8  0.563 
+    ##  3 1.98e- 9  0.383 
+    ##  4 5.93e- 7  0.134 
+    ##  5 5.43e- 9  0.343 
+    ##  6 3.74e-10  0.507 
+    ##  7 2.34e- 2  0.233 
+    ##  8 1.39e- 1  0.753 
+    ##  9 2.80e- 7  0.794 
+    ## 10 2.41e- 4  0.528 
+    ## # ... with 90 more rows
+
+``` r
+wflw_glmnet_use <- wflw_glmnet_use %>%
+            update_model(model_spec_glmnet)
+```
+
+### Time series cross validation
+
+``` r
+resamples_tscv <- time_series_cv(
+    data        = training(splits) %>% drop_na(),
+    cumulative  = TRUE,
+    assess      = "12 month",
+    slice_limit = 10,
+    skip        = "6 month"
+    )
+
+resamples_tscv %>% 
+    tk_time_series_cv_plan() %>% 
+    plot_time_series_cv_plan(date, sala_trans, .facet_ncol = 2, .interactive = FALSE)
+```
+
+<img src="ml_fcast_test_files/figure-gfm/unnamed-chunk-28-1.png" width="100%" />
+
+``` r
+registerDoFuture()
+n_cores <- detectCores()
+plan(
+    strategy = cluster,
+    workers  = parallel::makeCluster(n_cores)
+    )
+
+set.seed(123)
+tune_results_glmnet <- wflw_glmnet_use %>%
+    tune_grid(
+        resamples = resamples_tscv,
+        grid      = grid_spec_glmnet,
+        metrics   = default_forecast_accuracy_metric_set(),
+        control   = control_grid(verbose = FALSE, save_pred = TRUE)
+        )
+
+ plan(strategy = sequential)
+ 
+ 
+ tune_results_glmnet %>%
+     autoplot() +
+     geom_smooth(se = FALSE)
+```
+
+<img src="ml_fcast_test_files/figure-gfm/unnamed-chunk-29-1.png" width="100%" />
+
+``` r
+wflw_glmnet_final <-  wflw_glmnet_use %>%
+    finalize_workflow(
+        tune_results_glmnet %>% show_best(metric = "rmse") %>% dplyr::slice(1)
+        ) %>%
+    fit(training(splits) %>% drop_na())
+
+calibrate_and_plot(wflw_glmnet_final)
+```
+
+    ## # A tibble: 1 x 9
+    ##   .model_id .model_desc .type   mae  mape  mase smape  rmse   rsq
+    ##       <int> <chr>       <chr> <dbl> <dbl> <dbl> <dbl> <dbl> <dbl>
+    ## 1         1 GLMNET      Test  0.638  11.4 0.584  9.89 0.989    NA
+
+<img src="ml_fcast_test_files/figure-gfm/unnamed-chunk-30-1.png" width="100%" />
+
+### K-fold cross validation
+
+``` r
+resamples_kfold <- vfold_cv(
+    data = training(splits) %>% drop_na(),
+    v = 10,
+    repeats = 1
+    )
+
+resamples_kfold %>% 
+    tk_time_series_cv_plan() %>% 
+    plot_time_series_cv_plan(date, sala_trans, .facet_ncol = 2, .interactive = FALSE)
+```
+
+<img src="ml_fcast_test_files/figure-gfm/unnamed-chunk-31-1.png" width="100%" />
+
+``` r
+registerDoFuture()
+n_cores <- detectCores()
+plan(
+    strategy = cluster,
+    workers  = parallel::makeCluster(n_cores)
+    )
+
+set.seed(123)
+tune_results_glmnet_kfold <- wflw_glmnet_use %>%
+    tune_grid(
+        resamples = resamples_kfold,
+        grid      = grid_spec_glmnet,
+        metrics   = default_forecast_accuracy_metric_set(),
+        control   = control_grid(verbose = FALSE, save_pred = TRUE)
+        )
+
+ plan(strategy = sequential)
+ 
+ 
+ tune_results_glmnet_kfold %>%
+     autoplot() +
+     geom_smooth(se = FALSE)
+```
+
+<img src="ml_fcast_test_files/figure-gfm/unnamed-chunk-32-1.png" width="100%" />
+
+``` r
+wflw_glmnet_final_kfold <-  wflw_glmnet_use %>%
+    finalize_workflow(
+        tune_results_glmnet_kfold %>% show_best(metric = "rmse") %>% dplyr::slice(1)
+        ) %>%
+    fit(training(splits) %>% drop_na())
+
+calibrate_and_plot(wflw_glmnet_final_kfold)
+```
+
+    ## # A tibble: 1 x 9
+    ##   .model_id .model_desc .type   mae  mape  mase smape  rmse     rsq
+    ##       <int> <chr>       <chr> <dbl> <dbl> <dbl> <dbl> <dbl>   <dbl>
+    ## 1         1 GLMNET      Test  0.634  11.3 0.581  9.84 0.990 0.00400
+
+<img src="ml_fcast_test_files/figure-gfm/unnamed-chunk-33-1.png" width="100%" />
+
+## XGBoost
+
+``` r
+wflw_xgboost_use <- wflw_fit_glmnet_lag
+
+recipe_xgboost_use <- wflw_xgboost_use %>%
+                pull_workflow_preprocessor()
+
+model_spec_xgboost <- boost_tree(
+    mode = "regression",
+    mtry =  tune(),
+    trees = 500,
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune()
+    ) %>%
+    set_engine("xgboost")
+
+grid_spec_xgboost <- grid_latin_hypercube(
+    parameters(model_spec_xgboost) %>% 
+        update(mtry = mtry(range = c(1, 61))),
+    size = 100
+    )
+
+grid_spec_xgboost
+```
+
+    ## # A tibble: 100 x 5
+    ##     mtry min_n tree_depth learn_rate loss_reduction
+    ##    <int> <int>      <int>      <dbl>          <dbl>
+    ##  1    44    10          2   1.01e- 9 0.0000235     
+    ##  2    29    11         15   5.63e- 7 8.26          
+    ##  3     9     6         13   8.99e- 2 0.00000139    
+    ##  4    42     4          4   9.87e- 9 0.0000000148  
+    ##  5    21    26         10   2.01e- 8 0.0363        
+    ##  6    25    19          4   3.28e- 6 0.000000000142
+    ##  7    15    28         14   2.11e-10 0.000000438   
+    ##  8    45    22          3   2.17e- 5 0.000000715   
+    ##  9    24    16          5   6.22e- 3 0.00555       
+    ## 10    16    28         14   9.42e- 3 0.000000000255
+    ## # ... with 90 more rows
+
+``` r
+wflw_xgboost_use <- wflw_xgboost_use %>%
+            update_model(model_spec_xgboost)
+```
+
+### Time series cross validation
+
+``` r
+registerDoFuture()
+n_cores <- detectCores()
+plan(
+    strategy = cluster,
+    workers  = parallel::makeCluster(n_cores)
+    )
+
+set.seed(123)
+tune_results_xgboost <- wflw_xgboost_use %>%
+    tune_grid(
+        resamples = resamples_tscv,
+        grid      = grid_spec_xgboost,
+        metrics   = default_forecast_accuracy_metric_set(),
+        control   = control_grid(verbose = FALSE, save_pred = TRUE)
+        )
+
+ plan(strategy = sequential)
+ 
+ 
+ tune_results_xgboost %>%
+     autoplot() +
+     geom_smooth(se = FALSE)
+```
+
+<img src="ml_fcast_test_files/figure-gfm/unnamed-chunk-35-1.png" width="100%" />
+
+``` r
+wflw_xgboost_final <-  wflw_xgboost_use %>%
+    finalize_workflow(
+        tune_results_xgboost %>% show_best(metric = "rmse") %>% dplyr::slice(1)
+        ) %>%
+    fit(training(splits) %>% drop_na())
+
+calibrate_and_plot(wflw_xgboost_final)
+```
+
+    ## # A tibble: 1 x 9
+    ##   .model_id .model_desc .type   mae  mape  mase smape  rmse    rsq
+    ##       <int> <chr>       <chr> <dbl> <dbl> <dbl> <dbl> <dbl>  <dbl>
+    ## 1         1 XGBOOST     Test  0.653  11.6 0.598  10.1  1.01 0.0904
+
+<img src="ml_fcast_test_files/figure-gfm/unnamed-chunk-36-1.png" width="100%" />
+
+### K-fold cross validation
+
+``` r
+registerDoFuture()
+n_cores <- detectCores()
+plan(
+    strategy = cluster,
+    workers  = parallel::makeCluster(n_cores)
+    )
+
+set.seed(123)
+tune_results_xgboost_kfold <- wflw_xgboost_use %>%
+    tune_grid(
+        resamples = resamples_kfold,
+        grid      = grid_spec_xgboost,
+        metrics   = default_forecast_accuracy_metric_set(),
+        control   = control_grid(verbose = FALSE, save_pred = TRUE)
+        )
+
+ plan(strategy = sequential)
+ 
+ 
+ tune_results_xgboost_kfold %>%
+     autoplot() +
+     geom_smooth(se = FALSE)
+```
+
+<img src="ml_fcast_test_files/figure-gfm/unnamed-chunk-37-1.png" width="100%" />
+
+``` r
+wflw_xgboost_final_kfold <-  wflw_xgboost_use %>%
+    finalize_workflow(
+        tune_results_xgboost_kfold %>% show_best(metric = "rmse") %>% dplyr::slice(1)
+        ) %>%
+    fit(training(splits) %>% drop_na())
+
+calibrate_and_plot(wflw_xgboost_final_kfold)
+```
+
+    ## # A tibble: 1 x 9
+    ##   .model_id .model_desc .type   mae  mape  mase smape  rmse    rsq
+    ##       <int> <chr>       <chr> <dbl> <dbl> <dbl> <dbl> <dbl>  <dbl>
+    ## 1         1 XGBOOST     Test  0.653  11.6 0.598  10.1  1.01 0.0904
+
+<img src="ml_fcast_test_files/figure-gfm/unnamed-chunk-38-1.png" width="100%" />
